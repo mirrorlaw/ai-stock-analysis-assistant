@@ -1,23 +1,27 @@
 
 import { useState, useRef, useEffect } from 'react';
-import { Send, LineChart as ChartIcon } from 'lucide-react';
+import { Send, LineChart as ChartIcon, RotateCcw } from 'lucide-react';
 import StockChart from './StockChart';
 import BalanceSheet from './BalanceSheet';
 import AnalystRating from './AnalystRating';
+import StockNews from './StockNews';
 import ReactMarkdown from 'react-markdown';
 
 interface Message {
     role: 'user' | 'assistant';
     content: string;
-    type?: 'text' | 'chart' | 'balance_sheet' | 'analyst_rating';
+    type?: 'text' | 'chart' | 'balance_sheet' | 'analyst_rating' | 'news';
     data?: any;
-    forecastData?: any[]; // Attach forecast to chart messages
+    forecastData?: any[];
 }
 
+const INITIAL_MESSAGE: Message = {
+    role: 'assistant',
+    content: 'Hello! I can analyze stocks. Try asking "Analyze NVDA balance sheet" or "Show me Apple stock chart".',
+};
+
 export default function ChatInterface() {
-    const [messages, setMessages] = useState<Message[]>([
-        { role: 'assistant', content: 'Hello! I can analyze stocks. Try asking "Analyze NVDA balance sheet" or "Show me Apple stock chart".' }
-    ]);
+    const [messages, setMessages] = useState<Message[]>([INITIAL_MESSAGE]);
     const [input, setInput] = useState('');
     const [loading, setLoading] = useState(false);
     const scrollRef = useRef<HTMLDivElement>(null);
@@ -28,6 +32,12 @@ export default function ChatInterface() {
             scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
         }
     }, [messages]);
+
+    // #2: 새 대화 시작 — 메시지 초기화 + 새 threadId 생성
+    const handleReset = () => {
+        setMessages([INITIAL_MESSAGE]);
+        threadIdRef.current = 'thread-' + Date.now();
+    };
 
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -41,9 +51,7 @@ export default function ChatInterface() {
         try {
             const response = await fetch('/api/chat', {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     prompt: { content: newMsg.content, role: 'user', id: Date.now().toString() },
                     threadId: threadIdRef.current,
@@ -73,7 +81,13 @@ export default function ChatInterface() {
                     if (event.type === 'text') {
                         setMessages(prev => {
                             const last = prev[prev.length - 1];
-                            if (last.role === 'assistant' && last.type !== 'chart' && last.type !== 'balance_sheet' && last.type !== 'analyst_rating') {
+                            if (
+                                last.role === 'assistant' &&
+                                last.type !== 'chart' &&
+                                last.type !== 'balance_sheet' &&
+                                last.type !== 'analyst_rating' &&
+                                last.type !== 'news'
+                            ) {
                                 return [...prev.slice(0, -1), { ...last, content: last.content + event.content }];
                             } else {
                                 return [...prev, { role: 'assistant', content: event.content, type: 'text' }];
@@ -85,6 +99,8 @@ export default function ChatInterface() {
                         setMessages(prev => [...prev, { role: 'assistant', content: '', type: 'balance_sheet', data: event.data }]);
                     } else if (event.type === 'analyst_rating') {
                         setMessages(prev => [...prev, { role: 'assistant', content: '', type: 'analyst_rating', data: event.data }]);
+                    } else if (event.type === 'news') {
+                        setMessages(prev => [...prev, { role: 'assistant', content: '', type: 'news', data: event.data }]);
                     } else if (event.type === 'forecast') {
                         setMessages(prev => {
                             const reversed = [...prev].reverse();
@@ -107,11 +123,8 @@ export default function ChatInterface() {
                 const { done, value } = await reader.read();
                 if (done) break;
 
-                // stream: true 옵션으로 멀티바이트 문자가 청크 경계에 걸려도 안전하게 디코딩
                 buffer += decoder.decode(value, { stream: true });
                 const lines = buffer.split('\n');
-
-                // 마지막 항목은 불완전한 줄일 수 있으므로 버퍼에 유지
                 buffer = lines.pop() ?? '';
 
                 for (const line of lines) {
@@ -119,7 +132,6 @@ export default function ChatInterface() {
                 }
             }
 
-            // 스트림 종료 후 버퍼에 남은 데이터 처리
             decoder.decode(); // flush
             if (buffer.trim()) processLine(buffer);
 
@@ -134,11 +146,22 @@ export default function ChatInterface() {
 
     return (
         <div className="flex flex-col h-screen bg-gray-900 text-gray-100 font-sans">
-            <header className="p-4 border-b border-gray-800 flex items-center gap-2">
-                <div className="p-2 bg-blue-600 rounded-lg">
-                    <ChartIcon size={20} className="text-white" />
+            <header className="p-4 border-b border-gray-800 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                    <div className="p-2 bg-blue-600 rounded-lg">
+                        <ChartIcon size={20} className="text-white" />
+                    </div>
+                    <h1 className="text-lg font-bold">AI Stock Analyst</h1>
                 </div>
-                <h1 className="text-lg font-bold">AI Stock Analyst</h1>
+                {/* #2: 새 대화 버튼 */}
+                <button
+                    onClick={handleReset}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-gray-400 hover:text-white border border-gray-700 hover:border-gray-500 rounded-lg transition-colors"
+                    title="새 대화 시작"
+                >
+                    <RotateCcw size={14} />
+                    새 대화
+                </button>
             </header>
 
             <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 space-y-6">
@@ -154,6 +177,8 @@ export default function ChatInterface() {
                                 <BalanceSheet data={msg.data} />
                             ) : msg.type === 'analyst_rating' ? (
                                 <AnalystRating data={msg.data} />
+                            ) : msg.type === 'news' ? (
+                                <StockNews data={msg.data} />
                             ) : (
                                 <div className="prose prose-invert prose-sm">
                                     <ReactMarkdown>{msg.content}</ReactMarkdown>
