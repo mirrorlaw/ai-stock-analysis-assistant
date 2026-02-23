@@ -101,6 +101,8 @@ export default function ChatInterface() {
                         setMessages(prev => [...prev, { role: 'assistant', content: '', type: 'analyst_rating', data: event.data }]);
                     } else if (event.type === 'news') {
                         setMessages(prev => [...prev, { role: 'assistant', content: '', type: 'news', data: event.data }]);
+                    } else if (event.type === 'error') {
+                        setMessages(prev => [...prev, { role: 'assistant', content: `오류: ${event.message}`, type: 'text' }]);
                     } else if (event.type === 'forecast') {
                         setMessages(prev => {
                             const reversed = [...prev].reverse();

@@ -34,6 +34,38 @@ MAX_THREADS = 200           # 최대 보유 스레드 수
 checkpointer = InMemorySaver()
 
 
+# ---------------------------------------------------------------------------
+# yfinance TTL 캐시 (#9)
+# ---------------------------------------------------------------------------
+class TTLCache:
+    """간단한 인메모리 TTL 캐시. 동일 요청의 yfinance 중복 호출을 방지한다."""
+
+    def __init__(self) -> None:
+        self._store: dict[str, tuple[any, float]] = {}
+
+    def get(self, key: str) -> any:
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        value, expires_at = entry
+        if time.time() < expires_at:
+            return value
+        del self._store[key]
+        return None
+
+    def set(self, key: str, value: any, ttl: int) -> None:
+        self._store[key] = (value, time.time() + ttl)
+
+    def clear_expired(self) -> None:
+        now = time.time()
+        expired = [k for k, (_, exp) in list(self._store.items()) if now >= exp]
+        for k in expired:
+            del self._store[k]
+
+
+cache = TTLCache()
+
+
 async def cleanup_old_threads() -> None:
     while True:
         await asyncio.sleep(THREAD_CLEANUP_INTERVAL)
@@ -51,6 +83,7 @@ async def cleanup_old_threads() -> None:
             thread_last_active.pop(tid, None)
         if expired:
             print(f"[cleanup] {len(expired)}개 만료 스레드 제거")
+        cache.clear_expired()  # 캐시 만료 항목도 함께 정리
 
 
 @asynccontextmanager
@@ -109,52 +142,86 @@ model = ChatOpenAI(model='gpt-4o')
 @tool('get_stock_price', description='A function that returns the current stock price based on a ticker symbol.')
 def get_stock_price(ticker: str):
     print('get_stock_price tool is being used')
+    key = f"stock_price:{ticker.upper()}"
+    if (cached := cache.get(key)) is not None:
+        print(f'[cache hit] {key}')
+        return cached
     stock = yf.Ticker(ticker)
     history = stock.history(period='5d')
     if history.empty:
         return f"No price data found for {ticker}."
-    return history['Close'].iloc[-1]
+    result = history['Close'].iloc[-1]
+    cache.set(key, result, ttl=60)       # 1분 — 실시간 가격
+    return result
 
 
 @tool('get_historical_stock_price', description='A function that returns the current stock price over time based on a ticker symbol and a start and end date.')
 def get_historical_stock_price(ticker: str, start_date: str, end_date: str):
     print('get_historical_stock_price tool is being used')
+    key = f"historical:{ticker.upper()}:{start_date}:{end_date}"
+    if (cached := cache.get(key)) is not None:
+        print(f'[cache hit] {key}')
+        return cached
     stock = yf.Ticker(ticker)
     hist = stock.history(start=start_date, end=end_date)
     hist.index = hist.index.astype('int64') // 1_000_000
-    return hist.to_dict()
+    result = hist.to_dict()
+    cache.set(key, result, ttl=300)      # 5분
+    return result
 
 
 @tool('get_balance_sheet', description='A function that returns the balance sheet based on a ticker symbol.')
 def get_balance_sheet(ticker: str):
     print('get_balance_sheet tool is being used')
+    key = f"balance_sheet:{ticker.upper()}"
+    if (cached := cache.get(key)) is not None:
+        print(f'[cache hit] {key}')
+        return cached
     stock = yf.Ticker(ticker)
     bs = stock.balance_sheet
     if bs is None or bs.empty:
         return "No balance sheet data found."
-    return json.loads(bs.to_json(orient='split'))
+    result = json.loads(bs.to_json(orient='split'))
+    cache.set(key, result, ttl=3600)     # 1시간 — 재무제표는 자주 바뀌지 않음
+    return result
 
 
 @tool('get_stock_news', description='A function that returns news based on a ticker symbol.')
 def get_stock_news(ticker: str):
     print('get_stock_news tool is being used')
+    key = f"news:{ticker.upper()}"
+    if (cached := cache.get(key)) is not None:
+        print(f'[cache hit] {key}')
+        return cached
     stock = yf.Ticker(ticker)
-    return stock.news
+    result = stock.news
+    cache.set(key, result, ttl=300)      # 5분
+    return result
 
 
 @tool('get_analyst_recommendations', description='A function that returns analyst recommendations based on a ticker symbol.')
 def get_analyst_recommendations(ticker: str):
     print('get_analyst_recommendations tool is being used')
+    key = f"analyst:{ticker.upper()}"
+    if (cached := cache.get(key)) is not None:
+        print(f'[cache hit] {key}')
+        return cached
     stock = yf.Ticker(ticker)
     recommendations = stock.recommendations
     if recommendations is not None and not recommendations.empty:
-        return recommendations.to_dict(orient='records')
+        result = recommendations.to_dict(orient='records')
+        cache.set(key, result, ttl=3600)  # 1시간
+        return result
     return "No recommendations found."
 
 
 @tool('generate_stock_forecast', description='A function that generates a price forecast for a ticker symbol for the next n months.')
 def generate_stock_forecast(ticker: str, months: int = 12):
     print('generate_stock_forecast tool is being used')
+    key = f"forecast:{ticker.upper()}:{months}"
+    if (cached := cache.get(key)) is not None:
+        print(f'[cache hit] {key}')
+        return cached
     stock = yf.Ticker(ticker)
     hist = stock.history(period="2y")
 
@@ -182,10 +249,12 @@ def generate_stock_forecast(ticker: str, months: int = 12):
     future_ordinal = [[d.toordinal()] for d in future_dates]
     predictions = regressor.predict(future_ordinal)
 
-    return [
+    result = [
         {"date": d.strftime("%Y-%m-%d"), "price": round(float(p), 2)}
         for d, p in zip(future_dates, predictions)
     ]
+    cache.set(key, result, ttl=3600)     # 1시간
+    return result
 
 
 agent = create_agent(
@@ -227,43 +296,49 @@ async def chat(request: RequestObject):
         thread_last_active.pop(oldest, None)
 
     async def generate():
-        async for event in agent.astream_events(
-            {'messages': [
-                SystemMessage('You are a stock analysis assistant. You have the ability to get real-time stock prices, historical stock prices (given a date range), news and balance sheet data for a given ticker symbol. You can converse in Korean. If the user asks about a stock in Korean, please infer the correct ticker symbol (e.g., "엔비디아" -> "NVDA").'),
-                HumanMessage(request.prompt.content)
-            ]},
-            config=config,
-            version="v1"
-        ):
-            kind = event["event"]
+        try:
+            async for event in agent.astream_events(
+                {'messages': [
+                    SystemMessage('You are a stock analysis assistant. You have the ability to get real-time stock prices, historical stock prices (given a date range), news and balance sheet data for a given ticker symbol. You can converse in Korean. If the user asks about a stock in Korean, please infer the correct ticker symbol (e.g., "엔비디아" -> "NVDA").'),
+                    HumanMessage(request.prompt.content)
+                ]},
+                config=config,
+                version="v1"
+            ):
+                kind = event["event"]
 
-            if kind == "on_chat_model_stream":
-                chunk = event["data"]["chunk"]
-                if chunk.content:
-                    yield json.dumps({'type': 'text', 'content': chunk.content}) + '\n'
+                if kind == "on_chat_model_stream":
+                    chunk = event["data"]["chunk"]
+                    if chunk.content:
+                        yield json.dumps({'type': 'text', 'content': chunk.content}) + '\n'
 
-            elif kind == "on_tool_end":
-                tool_name = event["name"]
-                output = event["data"].get("output")
+                elif kind == "on_tool_end":
+                    tool_name = event["name"]
+                    output = event["data"].get("output")
 
-                if tool_name == "get_historical_stock_price":
-                    yield json.dumps({'type': 'chart', 'data': output}) + '\n'
+                    if tool_name == "get_historical_stock_price":
+                        yield json.dumps({'type': 'chart', 'data': output}) + '\n'
 
-                elif tool_name == "generate_stock_forecast":
-                    yield json.dumps({'type': 'forecast', 'data': output}) + '\n'
+                    elif tool_name == "generate_stock_forecast":
+                        yield json.dumps({'type': 'forecast', 'data': output}) + '\n'
 
-                elif tool_name == "get_analyst_recommendations":
-                    yield json.dumps({'type': 'analyst_rating', 'data': output}) + '\n'
+                    elif tool_name == "get_analyst_recommendations":
+                        yield json.dumps({'type': 'analyst_rating', 'data': output}) + '\n'
 
-                elif tool_name == "get_stock_news":
-                    yield json.dumps({'type': 'news', 'data': output}) + '\n'
+                    elif tool_name == "get_stock_news":
+                        yield json.dumps({'type': 'news', 'data': output}) + '\n'
 
-                elif tool_name == "get_balance_sheet":
-                    try:
-                        yield json.dumps({'type': 'balance_sheet', 'data': output}) + '\n'
-                    except Exception as e:
-                        print(f"Error serializing balance sheet: {e}")
-                        yield json.dumps({'type': 'text', 'content': 'Error displaying balance sheet.'}) + '\n'
+                    elif tool_name == "get_balance_sheet":
+                        try:
+                            yield json.dumps({'type': 'balance_sheet', 'data': output}) + '\n'
+                        except Exception as e:
+                            print(f"Error serializing balance sheet: {e}")
+                            yield json.dumps({'type': 'error', 'message': 'Error displaying balance sheet.'}) + '\n'
+
+        except Exception as e:
+            # #11: 스트리밍 도중 발생한 에러를 클라이언트에 전달
+            print(f"[streaming error] {e}")
+            yield json.dumps({'type': 'error', 'message': str(e)}) + '\n'
 
     return StreamingResponse(generate(), media_type='text/event-stream',
                              headers={
