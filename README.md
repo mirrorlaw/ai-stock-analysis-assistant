@@ -77,11 +77,14 @@ npm run dev
 
 ## 환경변수
 
-`backend/.env` 파일에 아래 항목을 설정하세요.
+`backend/.env.example`을 복사해 `.env`를 만들고 값을 채워주세요.
 
-```env
-OPENAI_API_KEY=sk-...
+```bash
+cp backend/.env.example backend/.env
 ```
+
+> `.env` 파일은 `.gitignore`에 등록되어 있어 Git에 커밋되지 않습니다.
+> 실제 API 키는 절대 공개 저장소에 올리지 마세요.
 
 ## 사용 예시
 
